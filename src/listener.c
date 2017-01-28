@@ -190,6 +190,7 @@ new_listener() {
     listener->protocol = tls_protocol;
     listener->table_name = NULL;
     listener->access_log = NULL;
+    listener->transparent_proxy = 0;
     listener->log_bad_requests = 0;
     listener->reference_count = 0;
     /* Initializes sock fd to negative sentinel value to indicate watchers
@@ -297,9 +298,14 @@ accept_listener_fallback_address(struct Listener *listener, char *fallback) {
 
 int
 accept_listener_source_address(struct Listener *listener, char *source) {
-    if (listener->source_address != NULL) {
+    if (listener->source_address != NULL || listener->transparent_proxy) {
         err("Duplicate source address: %s", source);
         return 0;
+    }
+
+    if (strcasecmp("client", source) == 0) {
+        listener->transparent_proxy = 1;
+        return 1;
     }
 
     listener->source_address = new_address(source);
@@ -422,12 +428,22 @@ init_listener(struct Listener *listener, const struct Table_head *tables, struct
     int sockfd = socket(address_sa(listener->address)->sa_family, SOCK_STREAM, 0);
     if (sockfd < 0) {
         err("socket failed: %s", strerror(errno));
-        return -2;
+        return sockfd;
     }
 
     /* set SO_REUSEADDR on server socket to facilitate restart */
     int on = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+    if (listener->transparent_proxy) {
+        int result = setsockopt(sockfd, SOL_IP, IP_TRANSPARENT, &on, sizeof(on));
+        if (result < 0) {
+            err("Failed to configure listener %s for transparent proxy: %s",
+                display_address(listener->address, address, sizeof(address)),
+                strerror(errno));
+            return result;
+        }
+    }
 
     int result = bind(sockfd, address_sa(listener->address),
             address_sa_len(listener->address));
@@ -440,20 +456,21 @@ init_listener(struct Listener *listener, const struct Table_head *tables, struct
             err("binder failed to bind to %s",
                 display_address(listener->address, address, sizeof(address)));
             close(sockfd);
-            return -3;
+            return sockfd;
         }
     } else if (result < 0) {
         err("bind %s failed: %s",
             display_address(listener->address, address, sizeof(address)),
             strerror(errno));
         close(sockfd);
-        return -3;
+        return result;
     }
 
-    if (listen(sockfd, SOMAXCONN) < 0) {
+    result = listen(sockfd, SOMAXCONN);
+    if (result < 0) {
         err("listen failed: %s", strerror(errno));
         close(sockfd);
-        return -4;
+        return result;
     }
 
 
